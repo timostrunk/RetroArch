@@ -21,6 +21,11 @@
 #define ALSA_PCM_NEW_SW_PARAMS_API
 #include <sys/asoundlib.h>
 
+#define MAX_FRAG_SIZE 3072
+#define DEFAULT_RATE 48000
+
+#define CHANNELS 2
+
 typedef struct alsa
 {
    snd_pcm_t *pcm;
@@ -29,11 +34,7 @@ typedef struct alsa
    bool has_float;
    bool can_pause;
    bool is_paused;
-   unsigned frame_bits;
 } alsa_t;
-
-#define MAX_FRAG_SIZE 3072
-#define DEFAULT_RATE 48000
 
 typedef long snd_pcm_sframes_t;
 
@@ -45,6 +46,7 @@ static void *alsa_qsa_init(const char *device, unsigned rate, unsigned latency)
 
    int err, card, dev;
    snd_pcm_channel_params_t params = {0};
+   snd_pcm_channel_info_t pi;
    snd_pcm_channel_setup_t setup = {0};
    alsa_t *alsa = (alsa_t*)calloc(1, sizeof(alsa_t));
    if (!alsa)
@@ -63,41 +65,48 @@ static void *alsa_qsa_init(const char *device, unsigned rate, unsigned latency)
       goto error;
    }
 
-   if ((err = snd_pcm_plugin_set_disable (alsa->pcm, PLUGIN_MMAP)) < 0)
+   if ((err = snd_pcm_plugin_set_disable (alsa->pcm, PLUGIN_DISABLE_MMAP)) < 0)
    {
       RARCH_ERR("[ALSA QSA]: Can't disable MMAP plugin: %s\n", snd_strerror(err));
       goto error;
    }
 
-   if ((err = snd_pcm_plugin_set_enable (alsa->pcm, PLUGIN_ROUTING)) < 0)
+   memset(&pi, 0, sizeof(pi));
+   pi.channel = SND_PCM_CHANNEL_PLAYBACK;
+   if ((err = snd_pcm_plugin_info(alsa->pcm, &pi)) < 0)
    {
-      RARCH_ERR("[ALSA QSA]: Can't enable routing: %s\n", snd_strerror(err));
+      RARCH_ERR("[ALSA QSA]: snd_pcm_plugin_info failed: %s\n",
+            snd_strerror(err));
       goto error;
    }
 
    memset(&params, 0, sizeof(params));
 
-
-
-   params.mode = SND_PCM_MODE_BLOCK;
    params.channel = SND_PCM_CHANNEL_PLAYBACK;
-   params.start_mode = SND_PCM_START_FULL;
-   params.stop_mode = SND_PCM_STOP_STOP;
+   params.mode = SND_PCM_MODE_BLOCK;
 
-   params.buf.block.frag_size = MAX_FRAG_SIZE;
-   params.buf.block.frags_min = 2;
-   params.buf.block.frags_max = 1;
    params.format.interleave = 1;
+   params.format.format = SND_PCM_SFMT_S16_LE;
    params.format.rate = DEFAULT_RATE;
    params.format.voices = 2;
 
-   params.format.format = SND_PCM_SFMT_S16_LE;
-   alsa->frame_bits = 16 * 2; /* bits * channel */
+   params.start_mode = SND_PCM_START_FULL;
+   params.stop_mode = SND_PCM_STOP_STOP;
 
-#if 0
-   /* TODO/FIXME - invalid argument? */
-   snd_pcm_plugin_set_disable(alsa->pcm, PLUGIN_DISABLE_BUFFER_PARTIAL_BLOCKS);
-#endif
+   params.buf.block.frag_size = pi.max_fragment_size;
+   params.buf.block.frags_min = 1;
+   params.buf.block.frags_max = 8;
+
+   //FIXME: Hack turning on g_extern.verbose 
+   bool original_verbosity = g_extern.verbose;
+   g_extern.verbose = true;
+
+   RARCH_LOG("Fragment size: %d\n", params.buf.block.frag_size);
+   RARCH_LOG("Min Fragment size: %d\n", params.buf.block.frags_min);
+   RARCH_LOG("Max Fragment size: %d\n", params.buf.block.frags_max);
+
+   //FIXME: Hack turning on/off g_extern.verbose 
+   g_extern.verbose = original_verbosity;
 
    if ((err = snd_pcm_plugin_params(alsa->pcm, &params)) < 0)
    {
@@ -134,56 +143,57 @@ error:
    return (void*)-1;
 }
 
-static inline snd_pcm_sframes_t snd_pcm_bytes_to_frames(alsa_t *alsa, ssize_t bytes)
-{
-   return bytes * 8 / alsa->frame_bits;
-}
-
-static ssize_t alsa_qsa_write(void *data, const void *buf, size_t size_)
+static ssize_t alsa_qsa_write(void *data, const void *buf, size_t size)
 {
    int status;
    alsa_t *alsa = (alsa_t*)data;
    snd_pcm_channel_status_t cstatus = {0};
    snd_pcm_sframes_t written = 0;
-   snd_pcm_sframes_t size = snd_pcm_bytes_to_frames(alsa, size_);
-   bool eagain_retry = true;
 
+   /* Write the audio data, checking for EAGAIN (buffer full) and underrun */
    while (size)
    {
       snd_pcm_sframes_t frames = snd_pcm_plugin_write(alsa->pcm, buf, size);
 
-      if (frames <= 0)
-      {
-         if (frames == -EAGAIN && !alsa->nonblock) // Definitely not supposed to happen.
-         {
-            RARCH_WARN("[ALSA]: poll() was signaled, but EAGAIN returned from write.\n"
-                  "Your ALSA driver might be subtly broken.\n");
+      if (frames == size)
+         goto increment;
 
-            if (eagain_retry)
-            {
-               eagain_retry = false;
-               continue;
-            }
-            else
-               return written;
-         }
-         else if (frames == -EAGAIN) // Expected if we're running nonblock.
-         {
-            return written;
-         }
-         /* TODO/FIXME - implement check_pcm_status for checking against more errors? */
-         else if (frames < 0)
-         {
-            RARCH_ERR("[ALSA]: Unknown error occured (%s).\n", snd_strerror(frames));
-            return -1;
-         }
+      /* Check if samples playback got stuck somewhere in hardware or in */
+      /* the audio device driver */
+      if (((errno == EAGAIN)) && (written == 0))
+      {
+         RARCH_ERR("Sample got stuck somewhere in hardware or in audio device driver.\n");
+         written += frames;
+         buf     += (frames * CHANNELS) * (alsa->has_float ? sizeof(float) : sizeof(int16_t));
+         return 0;
       }
       else
       {
-         written += frames;
-         buf     += (frames << 1) * (alsa->has_float ? sizeof(float) : sizeof(int16_t));
-         size    -= frames;
+         if ((errno == EINVAL) || (errno == EIO))
+         {
+            cstatus.channel = SND_PCM_CHANNEL_PLAYBACK;
+            status = snd_pcm_plugin_status(alsa->pcm, &cstatus);
+
+            if (status > 0)
+               return 0;
+
+            if ((cstatus.status == SND_PCM_STATUS_UNDERRUN) ||
+                  (cstatus.status == SND_PCM_STATUS_READY))
+            {
+               status = snd_pcm_plugin_prepare(alsa->pcm, SND_PCM_CHANNEL_PLAYBACK);
+               if (status < 0)
+                  return 0;
+            }
+            continue;
+         }
       }
+
+      return 0;
+
+increment:
+      written += frames;
+      buf     += (frames * CHANNELS) * (alsa->has_float ? sizeof(float) : sizeof(int16_t));
+      size -= frames;
    }
 
    return written;
@@ -304,4 +314,3 @@ const audio_driver_t audio_alsa = {
    alsa_qsa_write_avail,
    alsa_qsa_buffer_size,
 };
-
